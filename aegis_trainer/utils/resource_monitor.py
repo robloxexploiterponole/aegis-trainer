@@ -3,8 +3,9 @@ ResourceMonitor — CPU, RAM, and VRAM usage tracking for AEGIS AI Trainer.
 
 Designed for Intel Arc B580 (Vulkan, NOT CUDA). VRAM detection priority:
   1. torch.xpu.mem_get_info() via Intel Extension for PyTorch (IPEX)
-  2. sysfs /sys/class/drm/card*/device/mem_info_vram_used (Intel i915/xe driver)
-  3. Fallback to 0/0 (no VRAM monitoring)
+  2. sysfs /sys/class/drm/card*/device/mem_info_vram_used (Intel i915 driver)
+  3. debugfs /sys/kernel/debug/dri/*/vram0_mm (Intel xe driver, kernel 6.x+)
+  4. Fallback to 0/0 (no VRAM monitoring)
 
 Never calls torch.cuda.* — it will fail on this hardware.
 
@@ -112,7 +113,9 @@ class ResourceMonitor:
         if self._vram_backend == "xpu":
             logger.info("VRAM monitoring via torch.xpu (Intel IPEX)")
         elif self._vram_backend == "sysfs":
-            logger.info("VRAM monitoring via sysfs (Intel DRM driver)")
+            logger.info("VRAM monitoring via sysfs (Intel i915 driver)")
+        elif self._vram_backend == "debugfs":
+            logger.info("VRAM monitoring via debugfs (Intel xe driver)")
         else:
             logger.warning(
                 "No VRAM monitoring available. VRAM usage will report 0/0."
@@ -136,7 +139,7 @@ class ResourceMonitor:
         except Exception:
             pass
 
-        # 2. Try sysfs for Intel DRM devices
+        # 2. Try sysfs for Intel i915 driver
         drm_path = Path("/sys/class/drm")
         if drm_path.exists():
             for card_dir in sorted(drm_path.glob("card*")):
@@ -144,6 +147,20 @@ class ResourceMonitor:
                 vram_total = card_dir / "device" / "mem_info_vram_total"
                 if vram_used.exists() and vram_total.exists():
                     return "sysfs"
+
+        # 3. Try debugfs for Intel xe driver (kernel 6.x+, Battlemage/BMG)
+        # xe exposes vram0_mm with size/usage fields
+        debugfs_path = Path("/sys/kernel/debug/dri")
+        if debugfs_path.exists():
+            for dri_dir in sorted(debugfs_path.iterdir()):
+                vram_mm = dri_dir / "vram0_mm"
+                if vram_mm.exists():
+                    try:
+                        text = vram_mm.read_text()
+                        if "size:" in text and "usage:" in text:
+                            return "debugfs"
+                    except (OSError, PermissionError):
+                        pass
 
         return "none"
 
@@ -175,6 +192,8 @@ class ResourceMonitor:
             return self._get_vram_xpu()
         elif self._vram_backend == "sysfs":
             return self._get_vram_sysfs()
+        elif self._vram_backend == "debugfs":
+            return self._get_vram_debugfs()
         return 0, 0
 
     @staticmethod
@@ -211,6 +230,38 @@ class ResourceMonitor:
                         return used, total
         except (OSError, ValueError) as exc:
             logger.debug("sysfs VRAM read failed: %s", exc)
+
+        return 0, 0
+
+    @staticmethod
+    def _get_vram_debugfs() -> Tuple[int, int]:
+        """Read VRAM from Intel xe driver debugfs (vram0_mm).
+
+        The xe driver (kernel 6.x+, Battlemage/Arc) exposes VRAM stats at
+        /sys/kernel/debug/dri/*/vram0_mm with 'size:' and 'usage:' fields
+        in bytes.
+        """
+        debugfs_path = Path("/sys/kernel/debug/dri")
+        try:
+            for dri_dir in sorted(debugfs_path.iterdir()):
+                vram_mm = dri_dir / "vram0_mm"
+                if not vram_mm.exists():
+                    continue
+
+                text = vram_mm.read_text()
+                total = 0
+                used = 0
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("size:"):
+                        total = int(stripped.split(":")[1].strip())
+                    elif stripped.startswith("usage:"):
+                        used = int(stripped.split(":")[1].strip())
+
+                if total > 0:
+                    return used, total
+        except (OSError, ValueError, PermissionError) as exc:
+            logger.debug("debugfs VRAM read failed: %s", exc)
 
         return 0, 0
 
